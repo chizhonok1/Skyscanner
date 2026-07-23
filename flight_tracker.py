@@ -3,7 +3,7 @@ import json
 import argparse
 from datetime import datetime, timezone
 import requests
-import google.generativeai as genai
+from google import genai
 
 # Конфигурация из переменных окружения
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -11,8 +11,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TRAVELPAYOUTS_TOKEN = os.environ.get("TRAVELPAYOUTS_TOKEN")
 
+# Новая официальная инициализация Gemini SDK (google-genai)
+client = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
 PRICE_HISTORY_FILE = "price_history.json"
 
@@ -86,7 +88,7 @@ def fetch_flights_fast_flights(origin, destination, date):
                 "source": "Google Flights (fast-flights)"
             }
     except Exception as e:
-        print(f"Fast-flights ошибся или библиотека отсутствует: {e}")
+        print(f"Fast-flights ошибка: {e}")
     return None
 
 def fetch_cheapest_flight(origin, destination, date):
@@ -96,26 +98,34 @@ def fetch_cheapest_flight(origin, destination, date):
     return flight
 
 def generate_gemini_analysis(route_info, current_flight, price_history):
-    if not GEMINI_API_KEY:
-        return f"✈️ Рейс {route_info['origin']} ➔ {route_info['destination']} ({route_info['date']}): ${current_flight.get('price_usd', 'N/A')}"
+    # Защита от NoneType
+    flight_data_safe = current_flight if isinstance(current_flight, dict) else {}
+    price_val = flight_data_safe.get('price_usd', 'Н/Д')
 
-    model = genai.GenerativeModel('gemini-2.5-flash')
+    if not client:
+        return f"✈️ Рейс {route_info['origin']} ➔ {route_info['destination']} ({route_info['date']}): ${price_val}"
+
     prompt = f"""
     Ты — эксперт по авиабилетам. Сформируй короткое и понятное уведомление для Telegram-бота.
     Маршрут: {route_info['origin']} ➔ {route_info['destination']} на {route_info['date']}.
-    Текущие данные о рейсе: {json.dumps(current_flight, ensure_ascii=False)}
+    Текущие данные о рейсе: {json.dumps(flight_data_safe, ensure_ascii=False)}
     История прошлых цен: {json.dumps(price_history, ensure_ascii=False)}
 
     Требования:
-    1. Использовать смайлики (эмодзи).
-    2. Указать цену в $, авиакомпанию, время вылета.
-    3. Сравнить с предыдущими ценами и дать короткую рекомендацию (упала/поднялась цена, стоит ли покупать).
+    1. Использовать эмодзи.
+    2. Указать цену в $, авиакомпанию, время вылета (если есть).
+    3. Сравнить с прошлыми ценами и дать короткую рекомендацию (стоит ли покупать).
     """
     try:
-        response = model.generate_content(prompt)
+        # Используем официальную актуальную модель gemini-2.5-flash
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
         return response.text
     except Exception as e:
-        return f"✈️ Билет {route_info['origin']} ➔ {route_info['destination']} ({route_info['date']}): ${current_flight.get('price_usd', 'N/A')}"
+        print(f"Ошибка Gemini API: {e}")
+        return f"✈️ Билет {route_info['origin']} ➔ {route_info['destination']} ({route_info['date']}): ${price_val}"
 
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -148,7 +158,7 @@ def main():
         if key not in history:
             history[key] = []
 
-        if flight_data and flight_data.get("price_usd"):
+        if isinstance(flight_data, dict) and flight_data.get("price_usd"):
             history[key].append({
                 "timestamp": now_str,
                 "price_usd": flight_data["price_usd"],
