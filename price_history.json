@@ -1,5 +1,11 @@
 {
-  "ALC_WAW_2026-10-08": [],
+  "ALC_WAW_2026-10-08": [
+    {
+      "timestamp": "2026-07-24 00:38 UTC",
+      "price_usd": 242.0,
+      "source": "Gemini Search"
+    }
+  ],
   "ALC_WAW_2026-10-09": [
     {
       "timestamp": "2026-07-24 00:23 UTC",
@@ -10,8 +16,25 @@
       "timestamp": "2026-07-24 00:29 UTC",
       "price_usd": 115.0,
       "source": "Gemini Search"
+    },
+    {
+      "timestamp": "2026-07-24 00:38 UTC",
+      "price_usd": 115.0,
+      "source": "Gemini Search"
     }
   ],
-  "ALC_WAW_2026-10-10": [],
-  "ALC_WAW_2026-10-11": []
+  "ALC_WAW_2026-10-10": [
+    {
+      "timestamp": "2026-07-24 00:38 UTC",
+      "price_usd": 268.0,
+      "source": "Gemini Search"
+    }
+  ],
+  "ALC_WAW_2026-10-11": [
+    {
+      "timestamp": "2026-07-24 00:38 UTC",
+      "price_usd": 124.0,
+      "source": "Gemini Search"
+    }
+  ]
 }
