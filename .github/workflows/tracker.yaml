@@ -24,12 +24,10 @@ jobs:
 
       - name: Run Flight Tracker
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
-          ENABLE_GEMINI_SEARCH: ${{ vars.ENABLE_GEMINI_SEARCH }}
           DEBUG_GOOGLE_FLIGHTS: ${{ vars.DEBUG_GOOGLE_FLIGHTS }}
+          MAX_PRICE_USD: ${{ vars.MAX_PRICE_USD }}
         run: |
           python flight_tracker.py --origin ALC --destination WAW --dates 2026-10-08 2026-10-09 2026-10-10 2026-10-11
 
