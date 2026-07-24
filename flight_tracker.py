@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+import traceback
 from datetime import datetime, timezone
 import requests
 from google import genai
@@ -11,10 +12,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TRAVELPAYOUTS_TOKEN = os.environ.get("TRAVELPAYOUTS_TOKEN")
 
-# Новая официальная инициализация Gemini SDK (google-genai)
+# Инициализация Gemini
 client = None
 if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"Ошибка инициализации Gemini: {e}")
 
 PRICE_HISTORY_FILE = "price_history.json"
 
@@ -23,8 +27,7 @@ def load_price_history():
         try:
             with open(PRICE_HISTORY_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception as e:
-            print(f"Ошибка загрузки истории цен: {e}")
+        except Exception:
             return {}
     return {}
 
@@ -59,16 +62,17 @@ def fetch_flights_travelpayouts(origin, destination, date):
                         "airline": flight_info.get("airline", "N/A"),
                         "price_usd": flight_info.get("price"),
                         "flight_number": flight_info.get("flight_number", "N/A"),
-                        "departure_at": flight_info.get("departure_at"),
-                        "source": "Travelpayouts API"
+                        "source": "Travelpayouts"
                     }
     except Exception as e:
-        print(f"Ошибка получения данных из Travelpayouts: {e}")
+        print(f"Ошибка Travelpayouts: {e}")
     return None
 
 def fetch_flights_fast_flights(origin, destination, date):
     try:
         from fast_flights import FlightData, Passenger, FlightType, ServiceClass, get_flights
+        print(f"Пытаемся спарсить Google Flights для {origin} -> {destination} на {date}...")
+        
         result = get_flights(
             flight_data=[FlightData(date=date, from_airport=origin, to_airport=destination)],
             trip=FlightType.ONE_WAY,
@@ -76,19 +80,23 @@ def fetch_flights_fast_flights(origin, destination, date):
             service=ServiceClass.ECONOMY,
             currency="USD"
         )
+        
         if result and result.flights:
             sorted_flights = sorted(result.flights, key=lambda x: x.price if x.price else 9999)
             cheapest = sorted_flights[0]
+            price_val = float(str(cheapest.price).replace("$", "").replace(",", "").strip()) if cheapest.price else None
+            
+            print(f"✅ Успешно найдена цена: ${price_val}")
             return {
-                "airline": getattr(cheapest, "airline", "Ryanair / WizzAir"),
-                "price_usd": float(str(cheapest.price).replace("$", "").replace(",", "").strip()) if cheapest.price else None,
+                "airline": getattr(cheapest, "airline", "Неизвестно"),
+                "price_usd": price_val,
                 "flight_number": getattr(cheapest, "name", "N/A"),
-                "departure_at": getattr(cheapest, "departure", "N/A"),
-                "duration": getattr(cheapest, "duration", "N/A"),
-                "source": "Google Flights (fast-flights)"
+                "source": "Google Flights"
             }
+        else:
+            print("⚠️ Рейсы не найдены парсером fast-flights (возможно, Google заблокировал запрос или нет рейсов).")
     except Exception as e:
-        print(f"Fast-flights ошибка: {e}")
+        print(f"❌ Ошибка fast-flights:\n{traceback.format_exc()}")
     return None
 
 def fetch_cheapest_flight(origin, destination, date):
@@ -98,33 +106,38 @@ def fetch_cheapest_flight(origin, destination, date):
     return flight
 
 def generate_gemini_analysis(route_info, current_flight, price_history):
-    # Защита от NoneType
     flight_data_safe = current_flight if isinstance(current_flight, dict) else {}
-    price_val = flight_data_safe.get('price_usd', 'Н/Д')
+    price_val = flight_data_safe.get('price_usd')
+    
+    # Если цена так и не была найдена
+    if not price_val:
+        return (f"⚠️ **Рейс {route_info['origin']} ➔ {route_info['destination']} ({route_info['date']})**\n\n"
+                f"К сожалению, сейчас не удалось получить актуальную цену (возможно, данные скрыты или парсер заблокирован). "
+                f"Попробую снова при следующем запуске!")
 
     if not client:
-        return f"✈️ Рейс {route_info['origin']} ➔ {route_info['destination']} ({route_info['date']}): ${price_val}"
+        return f"✈️ Билет {route_info['origin']} ➔ {route_info['destination']} ({route_info['date']}): ${price_val}"
 
     prompt = f"""
-    Ты — эксперт по авиабилетам. Сформируй короткое и понятное уведомление для Telegram-бота.
+    Ты дружелюбный ИИ-помощник по поиску билетов.
     Маршрут: {route_info['origin']} ➔ {route_info['destination']} на {route_info['date']}.
-    Текущие данные о рейсе: {json.dumps(flight_data_safe, ensure_ascii=False)}
-    История прошлых цен: {json.dumps(price_history, ensure_ascii=False)}
+    Найденный билет: {json.dumps(flight_data_safe, ensure_ascii=False)}
+    История цен: {json.dumps(price_history, ensure_ascii=False)}
 
-    Требования:
-    1. Использовать эмодзи.
-    2. Указать цену в $, авиакомпанию, время вылета (если есть).
-    3. Сравнить с прошлыми ценами и дать короткую рекомендацию (стоит ли покупать).
+    Напиши короткое и красивое сообщение для Telegram (используй Markdown и эмодзи).
+    Укажи цену, авиакомпанию и сделай вывод: цена упала, выросла или осталась прежней (опираясь на историю).
+    Текст должен быть лаконичным, без лишней воды.
     """
+    
     try:
-        # Используем официальную актуальную модель gemini-2.5-flash
+        # Используем актуальную модель 3.6 Flash
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.6-flash',
             contents=prompt,
         )
         return response.text
     except Exception as e:
-        print(f"Ошибка Gemini API: {e}")
+        print(f"Ошибка при обращении к Gemini: {e}")
         return f"✈️ Билет {route_info['origin']} ➔ {route_info['destination']} ({route_info['date']}): ${price_val}"
 
 def send_telegram_message(text):
@@ -139,7 +152,7 @@ def send_telegram_message(text):
             res = requests.post(url, json=payload, timeout=10)
         return res.status_code == 200
     except Exception as e:
-        print(f"Ошибка отправки сообщения в Telegram: {e}")
+        print(f"Ошибка Telegram API: {e}")
         return False
 
 def main():
@@ -153,7 +166,9 @@ def main():
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     for date in args.dates:
+        print(f"\n--- Проверка даты: {date} ---")
         flight_data = fetch_cheapest_flight(args.origin, args.destination, date)
+        
         key = f"{args.origin}_{args.destination}_{date}"
         if key not in history:
             history[key] = []
@@ -167,6 +182,8 @@ def main():
 
         route_info = {"origin": args.origin, "destination": args.destination, "date": date}
         alert_msg = generate_gemini_analysis(route_info, flight_data, history[key])
+        
+        print(f"Сообщение для отправки:\n{alert_msg}")
         send_telegram_message(alert_msg)
 
     save_price_history(history)
