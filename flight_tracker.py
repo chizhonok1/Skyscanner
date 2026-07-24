@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+import re
 from datetime import datetime, timezone
 import requests
 from google import genai
@@ -8,6 +9,7 @@ from google.genai import types
 
 # Конфигурация
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -19,6 +21,28 @@ if GEMINI_API_KEY:
         print(f"Ошибка инициализации Gemini: {e}")
 
 PRICE_HISTORY_FILE = "price_history.json"
+
+def extract_price_usd(text):
+    if not text:
+        return 0
+
+    normalized = text.replace(",", ".")
+    patterns = [
+        r"(?:USD|\$)\s*(\d+(?:\.\d{1,2})?)",
+        r"(\d+(?:\.\d{1,2})?)\s*(?:USD|\$)",
+    ]
+
+    prices = []
+    for pattern in patterns:
+        for match in re.findall(pattern, normalized, flags=re.IGNORECASE):
+            try:
+                price = float(match)
+            except ValueError:
+                continue
+            if 10 <= price <= 5000:
+                prices.append(price)
+
+    return min(prices) if prices else 0
 
 def load_price_history():
     if os.path.exists(PRICE_HISTORY_FILE):
@@ -50,34 +74,38 @@ def analyze_with_gemini_search(route_info, price_history):
     {json.dumps(price_history, ensure_ascii=False)}
     
     ЗАДАЧА:
-    1. Сделай поиск в Google, чтобы найти актуальную минимальную цену на рейсы (Ryanair, Wizz Air и др.) для этого маршрута и даты.
-    2. Сформируй красивое сообщение для Telegram с использованием эмодзи.
-    3. Обязательно укажи найденную цену в USD. Если точной цены нет, укажи примерную стоимость из поиска.
+    1. Сделай поиск в Google, чтобы найти актуальную минимальную цену на рейсы для этого маршрута и даты.
+    2. Сформируй короткое сообщение для Telegram с использованием эмодзи.
+    3. Обязательно укажи цену в формате "$123 USD". Если точной цены нет, напиши, что точная цена не найдена.
     4. Опираясь на историю, напиши короткий совет (цена упала, выросла или осталась прежней).
     """
     
     try:
-        # Вызов Gemini с включенным инструментом поиска Google
+        # Вызов Gemini с актуальным инструментом Google Search.
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                tools=[{"google_search": {}}], # Включаем доступ в интернет!
+                tools=[types.Tool(google_search=types.GoogleSearch())],
                 temperature=0.2
             )
         )
+
+        response_text = (response.text or "").strip()
+        if not response_text:
+            raise ValueError("Gemini вернул пустой ответ")
         
-        # Вспомогательный запрос, чтобы вытащить только цифру для сохранения в историю
-        price_prompt = f"Найди в этом тексте минимальную стоимость билета в USD и напиши ТОЛЬКО число (например: 64). Если цены нет, напиши 0.\nТекст: {response.text}"
-        price_res = client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=price_prompt
-        )
+        extracted_price = extract_price_usd(response_text)
+        if not extracted_price:
+            price_prompt = f"Найди в этом тексте минимальную стоимость билета в USD и напиши ТОЛЬКО число. Если цены нет, напиши 0.\nТекст: {response_text}"
+            price_res = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=price_prompt
+            )
+            raw_price = (price_res.text or "").strip().replace("$", "").replace(" ", "").replace(",", ".")
+            extracted_price = float(raw_price) if raw_price.replace(".", "", 1).isdigit() else 0
         
-        raw_price = price_res.text.strip().replace('$', '').replace(' ', '')
-        extracted_price = float(raw_price) if raw_price.replace('.', '', 1).isdigit() else 0
-        
-        return response.text, extracted_price
+        return response_text, extracted_price
     except Exception as e:
         print(f"Ошибка Gemini Search: {e}")
         return f"⚠️ Не удалось проанализировать рейс {route_info['origin']} ➔ {route_info['destination']} на {route_info['date']}", None
