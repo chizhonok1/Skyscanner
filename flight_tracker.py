@@ -13,7 +13,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TRAVELPAYOUTS_TOKEN = os.environ.get("TRAVELPAYOUTS_TOKEN")
-FALLBACK_GEMINI_MODELS = ["gemini-2.5-flash"]
+FALLBACK_GEMINI_MODELS = ["gemini-3.5-flash-lite"]
 
 client = None
 if GEMINI_API_KEY:
@@ -186,7 +186,7 @@ def analyze_with_gemini_search(route_info, price_history):
     4. Опираясь на историю, напиши короткий совет (цена упала, выросла или осталась прежней).
     """
     
-    last_error = None
+    gemini_errors = []
     for model in get_gemini_models():
         try:
             # Вызов Gemini с актуальным инструментом Google Search.
@@ -217,13 +217,28 @@ def analyze_with_gemini_search(route_info, price_history):
 
             return response_text, extracted_price
         except Exception as e:
-            last_error = e
+            gemini_errors.append((model, e))
             print(f"Ошибка Gemini Search ({model}): {e}")
 
-    reason = short_error(last_error) if last_error else "неизвестная ошибка"
+    if gemini_errors:
+        reason = "; ".join(
+            f"{model}: {short_error(error)}"
+            for model, error in gemini_errors
+        )
+    else:
+        reason = "неизвестная ошибка"
+
+    travelpayouts_status = (
+        "Travelpayouts API не нашёл предложений на эту дату."
+        if TRAVELPAYOUTS_TOKEN
+        else "TRAVELPAYOUTS_TOKEN не добавлен в GitHub Secrets."
+    )
+
     return (
-        f"⚠️ Не удалось проанализировать рейс {route_info['origin']} ➔ {route_info['destination']} "
-        f"на {route_info['date']}\n\nПричина: {reason}",
+        f"⚠️ Цена не найдена для {route_info['origin']} ➔ {route_info['destination']} "
+        f"на {route_info['date']}\n\n"
+        f"{travelpayouts_status}\n"
+        f"Gemini Search недоступен: {reason}",
         None
     )
 
