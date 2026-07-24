@@ -12,6 +12,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TRAVELPAYOUTS_TOKEN = os.environ.get("TRAVELPAYOUTS_TOKEN")
+FALLBACK_GEMINI_MODELS = ["gemini-2.5-flash"]
 
 client = None
 if GEMINI_API_KEY:
@@ -21,6 +23,19 @@ if GEMINI_API_KEY:
         print(f"Ошибка инициализации Gemini: {e}")
 
 PRICE_HISTORY_FILE = "price_history.json"
+
+def get_gemini_models():
+    models = [model.strip() for model in GEMINI_MODEL.split(",") if model.strip()]
+    for model in FALLBACK_GEMINI_MODELS:
+        if model not in models:
+            models.append(model)
+    return models
+
+def short_error(error):
+    message = str(error).replace("\n", " ").strip()
+    if len(message) > 500:
+        message = message[:500] + "..."
+    return message or error.__class__.__name__
 
 def extract_price_usd(text):
     if not text:
@@ -44,6 +59,85 @@ def extract_price_usd(text):
 
     return min(prices) if prices else 0
 
+def compare_with_history(current_price, price_history):
+    previous_prices = [
+        item.get("price_usd")
+        for item in price_history
+        if isinstance(item.get("price_usd"), (int, float))
+    ]
+    if not previous_prices:
+        return "Пока это первая цена в истории наблюдений."
+
+    previous_price = previous_prices[-1]
+    if current_price < previous_price:
+        return f"Цена ниже прошлой (${previous_price:.0f} USD), можно присмотреться к покупке."
+    if current_price > previous_price:
+        return f"Цена выше прошлой (${previous_price:.0f} USD), лучше понаблюдать."
+    return "Цена не изменилась с прошлого замера."
+
+def fetch_travelpayouts_flight(origin, destination, date):
+    if not TRAVELPAYOUTS_TOKEN:
+        return None
+
+    params = {
+        "origin": origin,
+        "destination": destination,
+        "depart_date": date,
+        "currency": "usd",
+        "token": TRAVELPAYOUTS_TOKEN,
+    }
+
+    try:
+        response = requests.get(
+            "https://api.travelpayouts.com/v1/prices/cheap",
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as e:
+        print(f"Ошибка Travelpayouts API: {e}")
+        return None
+
+    if not payload.get("success"):
+        print(f"Travelpayouts API вернул неуспешный ответ: {payload}")
+        return None
+
+    route_data = payload.get("data", {}).get(destination, {})
+    offers = []
+    for offer in route_data.values():
+        price = offer.get("price")
+        if isinstance(price, (int, float)) and price > 0:
+            offers.append(offer)
+
+    if not offers:
+        return None
+
+    cheapest = min(offers, key=lambda offer: offer["price"])
+    return {
+        "airline": cheapest.get("airline", "N/A"),
+        "price_usd": float(cheapest["price"]),
+        "flight_number": cheapest.get("flight_number", "N/A"),
+        "departure_at": cheapest.get("departure_at", "N/A"),
+        "source": "Travelpayouts API",
+    }
+
+def format_flight_message(route_info, flight_data, price_history):
+    price = flight_data["price_usd"]
+    comparison = compare_with_history(price, price_history)
+    airline = flight_data.get("airline", "N/A")
+    departure = flight_data.get("departure_at", "N/A")
+    source = flight_data.get("source", "данные API")
+
+    return (
+        f"✈️ {route_info['origin']} ➔ {route_info['destination']} на {route_info['date']}\n"
+        f"💵 Минимальная цена: ${price:.0f} USD\n"
+        f"🛫 Авиакомпания: {airline}\n"
+        f"⏰ Вылет: {departure}\n"
+        f"📊 {comparison}\n"
+        f"Источник: {source}"
+    )
+
 def load_price_history():
     if os.path.exists(PRICE_HISTORY_FILE):
         try:
@@ -61,8 +155,20 @@ def save_price_history(history):
         print(f"Ошибка сохранения истории: {e}")
 
 def analyze_with_gemini_search(route_info, price_history):
+    travelpayouts_flight = fetch_travelpayouts_flight(
+        route_info["origin"],
+        route_info["destination"],
+        route_info["date"],
+    )
+    if travelpayouts_flight:
+        return format_flight_message(route_info, travelpayouts_flight, price_history), travelpayouts_flight["price_usd"]
+
     if not client:
-        return f"⚠️ Ошибка: Нет API ключа Gemini.", None
+        return (
+            "⚠️ Не удалось получить данные о рейсе.\n\n"
+            "Причина: нет доступного источника данных. Добавь GEMINI_API_KEY или TRAVELPAYOUTS_TOKEN в GitHub Secrets.",
+            None,
+        )
 
     prompt = f"""
     Ты — ИИ-помощник по поиску билетов. Твоя задача — найти актуальную цену на авиабилет в интернете и написать пост для Telegram.
@@ -80,35 +186,46 @@ def analyze_with_gemini_search(route_info, price_history):
     4. Опираясь на историю, напиши короткий совет (цена упала, выросла или осталась прежней).
     """
     
-    try:
-        # Вызов Gemini с актуальным инструментом Google Search.
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-                temperature=0.2
+    last_error = None
+    for model in get_gemini_models():
+        try:
+            # Вызов Gemini с актуальным инструментом Google Search.
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())]
+                )
             )
-        )
 
-        response_text = (response.text or "").strip()
-        if not response_text:
-            raise ValueError("Gemini вернул пустой ответ")
-        
-        extracted_price = extract_price_usd(response_text)
-        if not extracted_price:
-            price_prompt = f"Найди в этом тексте минимальную стоимость билета в USD и напиши ТОЛЬКО число. Если цены нет, напиши 0.\nТекст: {response_text}"
-            price_res = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=price_prompt
-            )
-            raw_price = (price_res.text or "").strip().replace("$", "").replace(" ", "").replace(",", ".")
-            extracted_price = float(raw_price) if raw_price.replace(".", "", 1).isdigit() else 0
-        
-        return response_text, extracted_price
-    except Exception as e:
-        print(f"Ошибка Gemini Search: {e}")
-        return f"⚠️ Не удалось проанализировать рейс {route_info['origin']} ➔ {route_info['destination']} на {route_info['date']}", None
+            response_text = (response.text or "").strip()
+            if not response_text:
+                raise ValueError("Gemini вернул пустой ответ")
+
+            extracted_price = extract_price_usd(response_text)
+            if not extracted_price:
+                price_prompt = f"Найди в этом тексте минимальную стоимость билета в USD и напиши ТОЛЬКО число. Если цены нет, напиши 0.\nТекст: {response_text}"
+                try:
+                    price_res = client.models.generate_content(
+                        model=model,
+                        contents=price_prompt
+                    )
+                    raw_price = (price_res.text or "").strip().replace("$", "").replace(" ", "").replace(",", ".")
+                    extracted_price = float(raw_price) if raw_price.replace(".", "", 1).isdigit() else 0
+                except Exception as price_error:
+                    print(f"Ошибка извлечения цены Gemini ({model}): {price_error}")
+
+            return response_text, extracted_price
+        except Exception as e:
+            last_error = e
+            print(f"Ошибка Gemini Search ({model}): {e}")
+
+    reason = short_error(last_error) if last_error else "неизвестная ошибка"
+    return (
+        f"⚠️ Не удалось проанализировать рейс {route_info['origin']} ➔ {route_info['destination']} "
+        f"на {route_info['date']}\n\nПричина: {reason}",
+        None
+    )
 
 def send_telegram_message(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
