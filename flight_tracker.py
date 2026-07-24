@@ -165,6 +165,67 @@ def fetch_travelpayouts_calendar_flight(origin, destination, date):
         "source": "Travelpayouts Calendar API",
     }
 
+def parse_google_flights_price(price):
+    if isinstance(price, (int, float)):
+        return float(price)
+    if not price:
+        return None
+
+    cleaned = str(price).replace(",", "")
+    match = re.search(r"(\d+(?:\.\d{1,2})?)", cleaned)
+    if not match:
+        return None
+
+    value = float(match.group(1))
+    return value if 10 <= value <= 5000 else None
+
+def fetch_google_flights(origin, destination, date):
+    try:
+        from fast_flights import FlightQuery, Passengers, create_query, get_flights
+    except Exception as e:
+        print(f"Ошибка импорта fast-flights: {e}")
+        return None
+
+    try:
+        query = create_query(
+            flights=[
+                FlightQuery(
+                    date=date,
+                    from_airport=origin,
+                    to_airport=destination,
+                )
+            ],
+            trip="one-way",
+            seat="economy",
+            passengers=Passengers(adults=1),
+            language="en-US",
+            currency="USD",
+        )
+        result = get_flights(query)
+    except Exception as e:
+        print(f"Ошибка Google Flights fast-flights: {e}")
+        return None
+
+    flights = getattr(result, "flights", result)
+    offers = []
+    for flight in flights or []:
+        price = parse_google_flights_price(getattr(flight, "price", None))
+        if not price:
+            continue
+        offers.append((price, flight))
+
+    if not offers:
+        return None
+
+    price, cheapest = min(offers, key=lambda item: item[0])
+    return {
+        "airline": getattr(cheapest, "name", None) or getattr(cheapest, "airline", "N/A"),
+        "price_usd": price,
+        "flight_number": getattr(cheapest, "flight_number", "N/A"),
+        "departure_at": getattr(cheapest, "departure", None) or getattr(cheapest, "departure_time", "N/A"),
+        "source": "Google Flights (fast-flights)",
+    }
+
 def format_flight_message(route_info, flight_data, price_history):
     price = flight_data["price_usd"]
     comparison = compare_with_history(price, price_history)
@@ -197,7 +258,7 @@ def save_price_history(history):
     except Exception as e:
         print(f"Ошибка сохранения истории: {e}")
 
-def analyze_with_gemini_search(route_info, price_history):
+def find_flight_price(route_info, price_history):
     travelpayouts_flight = fetch_travelpayouts_flight(
         route_info["origin"],
         route_info["destination"],
@@ -212,6 +273,14 @@ def analyze_with_gemini_search(route_info, price_history):
     if travelpayouts_flight:
         return format_flight_message(route_info, travelpayouts_flight, price_history), travelpayouts_flight["price_usd"]
 
+    google_flight = fetch_google_flights(
+        route_info["origin"],
+        route_info["destination"],
+        route_info["date"],
+    )
+    if google_flight:
+        return format_flight_message(route_info, google_flight, price_history), google_flight["price_usd"]
+
     if not ENABLE_GEMINI_SEARCH:
         travelpayouts_status = (
             "Travelpayouts API не нашёл предложений на эту дату."
@@ -222,6 +291,7 @@ def analyze_with_gemini_search(route_info, price_history):
             f"⚠️ Цена не найдена для {route_info['origin']} ➔ {route_info['destination']} "
             f"на {route_info['date']}\n\n"
             f"{travelpayouts_status}\n"
+            "Google Flights через fast-flights тоже не вернул цену.\n"
             "Gemini Search отключён, чтобы не расходовать квоту. Чтобы включить его, добавь "
             "ENABLE_GEMINI_SEARCH=true в GitHub Actions variables/secrets.",
             None,
@@ -302,6 +372,7 @@ def analyze_with_gemini_search(route_info, price_history):
         f"⚠️ Цена не найдена для {route_info['origin']} ➔ {route_info['destination']} "
         f"на {route_info['date']}\n\n"
         f"{travelpayouts_status}\n"
+        "Google Flights через fast-flights тоже не вернул цену.\n"
         f"Gemini Search недоступен: {reason}",
         None
     )
@@ -340,7 +411,7 @@ def main():
         route_info = {"origin": args.origin, "destination": args.destination, "date": date}
         
         # Получаем красивый текст и сырую цену
-        alert_msg, current_price = analyze_with_gemini_search(route_info, history[key])
+        alert_msg, current_price = find_flight_price(route_info, history[key])
         
         # Сохраняем в историю, только если нейросеть нашла реальную цифру больше нуля
         if current_price and current_price > 0:
