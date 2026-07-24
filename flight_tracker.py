@@ -14,6 +14,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TRAVELPAYOUTS_TOKEN = os.environ.get("TRAVELPAYOUTS_TOKEN")
 ENABLE_GEMINI_SEARCH = os.environ.get("ENABLE_GEMINI_SEARCH", "").lower() == "true"
+DEBUG_GOOGLE_FLIGHTS = os.environ.get("DEBUG_GOOGLE_FLIGHTS", "").lower() == "true"
 FALLBACK_GEMINI_MODELS = ["gemini-3.5-flash-lite"]
 
 client = None
@@ -179,6 +180,32 @@ def parse_google_flights_price(price):
     value = float(match.group(1))
     return value if 10 <= value <= 5000 else None
 
+def format_google_datetime(value):
+    date_part = getattr(value, "date", None)
+    time_part = getattr(value, "time", None)
+    if not date_part or not time_part:
+        return "N/A"
+
+    try:
+        year, month, day = date_part
+        hour, minute = time_part
+        return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}"
+    except Exception:
+        return str(value)
+
+def summarize_google_offer(flight):
+    legs = getattr(flight, "flights", None) or []
+    first_leg = legs[0] if legs else None
+    departure = format_google_datetime(getattr(first_leg, "departure", None)) if first_leg else "N/A"
+
+    return {
+        "price": getattr(flight, "price", None),
+        "airlines": getattr(flight, "airlines", None),
+        "type": getattr(flight, "type", None),
+        "departure": departure,
+        "legs": len(legs),
+    }
+
 def fetch_google_flights(origin, destination, date):
     try:
         from fast_flights import FlightQuery, Passengers, create_query, get_flights
@@ -207,6 +234,11 @@ def fetch_google_flights(origin, destination, date):
         return None
 
     flights = getattr(result, "flights", result)
+    if DEBUG_GOOGLE_FLIGHTS:
+        print("Google Flights raw offers:")
+        for index, flight in enumerate(list(flights or [])[:8], start=1):
+            print(f"{index}. {json.dumps(summarize_google_offer(flight), ensure_ascii=False)}")
+
     offers = []
     for flight in flights or []:
         price = parse_google_flights_price(getattr(flight, "price", None))
@@ -218,11 +250,17 @@ def fetch_google_flights(origin, destination, date):
         return None
 
     price, cheapest = min(offers, key=lambda item: item[0])
+    legs = getattr(cheapest, "flights", None) or []
+    first_leg = legs[0] if legs else None
+    airlines = getattr(cheapest, "airlines", None) or []
+    airline_text = ", ".join(airlines) if airlines else "N/A"
+    departure = format_google_datetime(getattr(first_leg, "departure", None)) if first_leg else "N/A"
+
     return {
-        "airline": getattr(cheapest, "name", None) or getattr(cheapest, "airline", "N/A"),
+        "airline": airline_text,
         "price_usd": price,
         "flight_number": getattr(cheapest, "flight_number", "N/A"),
-        "departure_at": getattr(cheapest, "departure", None) or getattr(cheapest, "departure_time", "N/A"),
+        "departure_at": departure,
         "source": "Google Flights (fast-flights)",
     }
 
@@ -271,7 +309,11 @@ def find_flight_price(route_info, price_history):
             route_info["date"],
         )
     if travelpayouts_flight:
-        return format_flight_message(route_info, travelpayouts_flight, price_history), travelpayouts_flight["price_usd"]
+        return (
+            format_flight_message(route_info, travelpayouts_flight, price_history),
+            travelpayouts_flight["price_usd"],
+            travelpayouts_flight["source"],
+        )
 
     google_flight = fetch_google_flights(
         route_info["origin"],
@@ -279,7 +321,11 @@ def find_flight_price(route_info, price_history):
         route_info["date"],
     )
     if google_flight:
-        return format_flight_message(route_info, google_flight, price_history), google_flight["price_usd"]
+        return (
+            format_flight_message(route_info, google_flight, price_history),
+            google_flight["price_usd"],
+            google_flight["source"],
+        )
 
     if not ENABLE_GEMINI_SEARCH:
         travelpayouts_status = (
@@ -295,12 +341,14 @@ def find_flight_price(route_info, price_history):
             "Gemini Search отключён, чтобы не расходовать квоту. Чтобы включить его, добавь "
             "ENABLE_GEMINI_SEARCH=true в GitHub Actions variables/secrets.",
             None,
+            None,
         )
 
     if not client:
         return (
             "⚠️ Не удалось получить данные о рейсе.\n\n"
             "Причина: нет доступного источника данных. Добавь GEMINI_API_KEY или TRAVELPAYOUTS_TOKEN в GitHub Secrets.",
+            None,
             None,
         )
 
@@ -349,7 +397,7 @@ def find_flight_price(route_info, price_history):
                 except Exception as price_error:
                     print(f"Ошибка извлечения цены Gemini ({model}): {price_error}")
 
-            return response_text, extracted_price
+            return response_text, extracted_price, "Gemini Search"
         except Exception as e:
             gemini_errors.append((model, e))
             print(f"Ошибка Gemini Search ({model}): {e}")
@@ -374,7 +422,8 @@ def find_flight_price(route_info, price_history):
         f"{travelpayouts_status}\n"
         "Google Flights через fast-flights тоже не вернул цену.\n"
         f"Gemini Search недоступен: {reason}",
-        None
+        None,
+        None,
     )
 
 def send_telegram_message(text):
@@ -411,14 +460,14 @@ def main():
         route_info = {"origin": args.origin, "destination": args.destination, "date": date}
         
         # Получаем красивый текст и сырую цену
-        alert_msg, current_price = find_flight_price(route_info, history[key])
+        alert_msg, current_price, source = find_flight_price(route_info, history[key])
         
-        # Сохраняем в историю, только если нейросеть нашла реальную цифру больше нуля
+        # Сохраняем в историю, только если один из источников нашёл реальную цену.
         if current_price and current_price > 0:
             history[key].append({
                 "timestamp": now_str,
                 "price_usd": current_price,
-                "source": "Gemini Search"
+                "source": source or "Unknown"
             })
         
         print(f"Отправка:\n{alert_msg}")
