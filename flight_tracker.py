@@ -13,6 +13,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TRAVELPAYOUTS_TOKEN = os.environ.get("TRAVELPAYOUTS_TOKEN")
+ENABLE_GEMINI_SEARCH = os.environ.get("ENABLE_GEMINI_SEARCH", "").lower() == "true"
 FALLBACK_GEMINI_MODELS = ["gemini-3.5-flash-lite"]
 
 client = None
@@ -122,6 +123,48 @@ def fetch_travelpayouts_flight(origin, destination, date):
         "source": "Travelpayouts API",
     }
 
+def fetch_travelpayouts_calendar_flight(origin, destination, date):
+    if not TRAVELPAYOUTS_TOKEN:
+        return None
+
+    month = date[:7]
+    params = {
+        "origin": origin,
+        "destination": destination,
+        "depart_date": month,
+        "calendar_type": "departure_date",
+        "currency": "usd",
+        "token": TRAVELPAYOUTS_TOKEN,
+    }
+
+    try:
+        response = requests.get(
+            "https://api.travelpayouts.com/v1/prices/calendar",
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as e:
+        print(f"Ошибка Travelpayouts Calendar API: {e}")
+        return None
+
+    if not payload.get("success"):
+        print(f"Travelpayouts Calendar API вернул неуспешный ответ: {payload}")
+        return None
+
+    offer = payload.get("data", {}).get(date)
+    if not offer or not isinstance(offer.get("price"), (int, float)):
+        return None
+
+    return {
+        "airline": offer.get("airline", "N/A"),
+        "price_usd": float(offer["price"]),
+        "flight_number": offer.get("flight_number", "N/A"),
+        "departure_at": offer.get("departure_at", f"{date}T00:00:00"),
+        "source": "Travelpayouts Calendar API",
+    }
+
 def format_flight_message(route_info, flight_data, price_history):
     price = flight_data["price_usd"]
     comparison = compare_with_history(price, price_history)
@@ -160,8 +203,29 @@ def analyze_with_gemini_search(route_info, price_history):
         route_info["destination"],
         route_info["date"],
     )
+    if not travelpayouts_flight:
+        travelpayouts_flight = fetch_travelpayouts_calendar_flight(
+            route_info["origin"],
+            route_info["destination"],
+            route_info["date"],
+        )
     if travelpayouts_flight:
         return format_flight_message(route_info, travelpayouts_flight, price_history), travelpayouts_flight["price_usd"]
+
+    if not ENABLE_GEMINI_SEARCH:
+        travelpayouts_status = (
+            "Travelpayouts API не нашёл предложений на эту дату."
+            if TRAVELPAYOUTS_TOKEN
+            else "TRAVELPAYOUTS_TOKEN не добавлен в GitHub Secrets."
+        )
+        return (
+            f"⚠️ Цена не найдена для {route_info['origin']} ➔ {route_info['destination']} "
+            f"на {route_info['date']}\n\n"
+            f"{travelpayouts_status}\n"
+            "Gemini Search отключён, чтобы не расходовать квоту. Чтобы включить его, добавь "
+            "ENABLE_GEMINI_SEARCH=true в GitHub Actions variables/secrets.",
+            None,
+        )
 
     if not client:
         return (
@@ -268,7 +332,7 @@ def main():
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     for date in args.dates:
-        print(f"\n--- Поиск билетов на: {date} через Google Search ---")
+        print(f"\n--- Поиск билетов на: {date} ---")
         key = f"{args.origin}_{args.destination}_{date}"
         if key not in history:
             history[key] = []
